@@ -3,7 +3,7 @@ import logging
 import schedule
 import time
 import requests
-import paho.mqtt.subscribe as subscribe
+import paho.mqtt.client as mqtt
 
 # Set up logging
 logging.basicConfig(
@@ -28,45 +28,63 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 CAR_ID = int(os.environ.get("CAR_ID", "1"))
 
-def fetch_data_mqtt():
-    """Fetch data from MQTT"""
-    results = {}
+COLLECT_SECONDS = float(os.environ.get("COLLECT_SECONDS", "3"))
 
-    # Define topics to fetch
-    topics = [
-        f"teslamate/cars/{CAR_ID}/state",
-        f"teslamate/cars/{CAR_ID}/battery_level",
-        f"teslamate/cars/{CAR_ID}/rated_battery_range_km",
-        f"teslamate/cars/{CAR_ID}/version",
-        f"teslamate/cars/{CAR_ID}/odometer",
-        f"teslamate/cars/{CAR_ID}/display_name",
-        f"teslamate/cars/{CAR_ID}/charger_power",
-        f"teslamate/cars/{CAR_ID}/charger_voltage",
-        f"teslamate/cars/{CAR_ID}/outside_temp",
-        f"teslamate/cars/{CAR_ID}/inside_temp",
-        f"teslamate/cars/{CAR_ID}/speed",
-        f"teslamate/cars/{CAR_ID}/power",
-    ]
+# TeslaMate topics to forward (teslamate/cars/<id>/<key>). Kept to what the
+# TRMNL plugin shows, so the webhook payload stays well under 5 kB.
+TOPICS = {
+    # car
+    "display_name", "model", "trim_badging", "version", "update_available",
+    "update_version",
+    # state
+    "state", "since", "geofence", "speed", "power",
+    # battery & charging
+    "battery_level", "usable_battery_level", "rated_battery_range_km",
+    "est_battery_range_km", "plugged_in", "charging_state", "charge_limit_soc",
+    "charger_power", "charger_voltage", "charger_actual_current",
+    "charger_phases", "charge_energy_added", "time_to_full_charge",
+    # climate
+    "inside_temp", "outside_temp", "is_climate_on", "is_preconditioning",
+    # security & body
+    "locked", "sentry_mode", "doors_open", "windows_open", "trunk_open",
+    "frunk_open",
+    # tyres
+    "tpms_pressure_fl", "tpms_pressure_fr", "tpms_pressure_rl",
+    "tpms_pressure_rr", "tpms_soft_warning_fl", "tpms_soft_warning_fr",
+    "tpms_soft_warning_rl", "tpms_soft_warning_rr",
+    # misc
+    "odometer",
+}
+
+def fetch_data_mqtt():
+    """Collect the retained TeslaMate values for this car in one connection"""
+    results = {}
+    prefix = f"teslamate/cars/{CAR_ID}/"
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        client.subscribe(prefix + "#")
+
+    def on_message(client, userdata, msg):
+        key = msg.topic[len(prefix):]
+        if key in TOPICS and msg.payload:
+            results[key] = msg.payload.decode().strip()
 
     try:
-        # Create a minimal client connection
-        auth = None
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if MQTT_USER and MQTT_PASSWORD:
-            auth = {"username": MQTT_USER, "password": MQTT_PASSWORD}
-
-        # Query each topic for the retained message
-        for topic in topics:
-            try:
-                msg = subscribe.simple(topic, hostname=MQTT_BROKER, port=MQTT_PORT, auth=auth, keepalive=1)
-                if msg and msg.payload:
-                    # Try to get the topic name without the prefix
-                    key = topic.split("/")[-1]
-                    results[key] = msg.payload.decode().strip()
-            except Exception as e:
-                logger.error(f"Could not get MQTT topic {topic}: {e}")
-
+            client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=30)
+        client.loop_start()
+        time.sleep(COLLECT_SECONDS)
+        client.loop_stop()
+        client.disconnect()
     except Exception as e:
         logger.error(f"Error fetching data from MQTT: {e}")
+
+    if results:
+        results["reported_at"] = str(int(time.time()))
 
     return results
 
